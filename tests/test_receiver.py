@@ -3,6 +3,7 @@ import http.client
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -125,6 +126,171 @@ class ReceiverTests(unittest.TestCase):
             response = client.recv(4096)
         self.assertIn(b"400", response)
         self.assertIsNone(self.inbox.receipt(chunk_id))
+
+
+class ExportTests(unittest.TestCase):
+    """The incremental export must be indistinguishable from a full rebuild."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def transcripts(self, inbox):
+        return {str(path.relative_to(inbox.root)): path.read_bytes()
+                for path in sorted(inbox.root.rglob("*.md"))}
+
+    def populate(self, inbox, starts):
+        with inbox.connect() as db:
+            for index, started in enumerate(starts):
+                db.execute("INSERT INTO chunks (id,sha256,device,started,duration,path,received)"
+                           " VALUES (?,?,?,?,?,?,?)",
+                           (f"{index:032x}", "0" * 64, "dev", started, 60.0, "", 0.0))
+
+    def build(self, order, starts, texts, incremental):
+        root = Path(tempfile.mkdtemp(dir=self.root))
+        inbox = Inbox(root)
+        self.populate(inbox, starts)
+        for index in order:
+            if incremental:
+                inbox.complete(f"{index:032x}", texts[index])
+            else:
+                with inbox.connect() as db:
+                    db.execute("UPDATE chunks SET status='complete',transcript=? WHERE id=?",
+                               (texts[index], f"{index:032x}"))
+        if not incremental:
+            inbox._rebuild()
+        return self.transcripts(inbox)
+
+    def test_incremental_export_matches_a_full_rebuild(self):
+        count = 40
+        starts, texts = [], []
+        for index in range(count):
+            hour = (23 + index // 20) % 24
+            day = 10 + (23 + index // 20) // 24
+            starts.append(f"2026-03-{day:02d}T{hour:02d}:{index % 60:02d}:00.000Z")
+            # Every seventh clip is silence the cleaner rejects, which must not
+            # emit a section or disturb the ordering watermark.
+            texts.append("" if index % 7 == 3 else f"clip {index} about the roadmap")
+        orders = {
+            "in order": list(range(count)),
+            "reverse backlog": list(range(count))[::-1],
+            "late straggler": list(range(1, count)) + [0],
+        }
+        for name, order in orders.items():
+            with self.subTest(order=name):
+                self.assertEqual(self.build(order, starts, texts, incremental=True),
+                                 self.build(order, starts, texts, incremental=False))
+
+    def test_export_repairs_a_transcript_edited_underneath_it(self):
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z", "2026-03-10T09:01:00.000Z"])
+        inbox.complete(f"{0:032x}", "first clip")
+        (inbox.root / "life.md").write_bytes(b"truncated")
+        inbox.complete(f"{1:032x}", "second clip")
+        life = (inbox.root / "life.md").read_text()
+        self.assertIn("first clip", life)
+        self.assertIn("second clip", life)
+
+    def test_a_missing_day_file_is_rebuilt_rather_than_replaced(self):
+        """A day file that vanished must not come back holding only the newest
+        clip while life.md still carries the rest."""
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z", "2026-03-10T09:01:00.000Z",
+                              "2026-03-10T09:02:00.000Z"])
+        inbox.complete(f"{0:032x}", "first clip")
+        inbox.complete(f"{1:032x}", "second clip")
+        (inbox.days / "2026-03-10.md").unlink()
+        inbox.complete(f"{2:032x}", "third clip")
+        day = (inbox.days / "2026-03-10.md").read_text()
+        for text in ("first clip", "second clip", "third clip"):
+            self.assertIn(text, day)
+
+    def test_a_silent_clip_does_not_bless_a_truncated_day_file(self):
+        """A clip the cleaner rejects writes nothing, so it must not carry the
+        watermark past a day file it never looked at."""
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z", "2026-03-10T09:01:00.000Z",
+                              "2026-03-10T09:02:00.000Z", "2026-03-10T09:03:00.000Z"])
+        inbox.complete(f"{0:032x}", "first clip")
+        inbox.complete(f"{1:032x}", "second clip")
+        (inbox.days / "2026-03-10.md").write_bytes(b"# 2026-03-10\n\n")
+        inbox.complete(f"{2:032x}", "[BLANK_AUDIO]")
+        inbox.complete(f"{3:032x}", "fourth clip")
+        day = (inbox.days / "2026-03-10.md").read_text()
+        for text in ("first clip", "second clip", "fourth clip"):
+            self.assertIn(text, day)
+
+    def test_audio_that_cannot_be_deleted_is_left_for_the_next_sweep(self):
+        """A stuck file must not fail a transcript that is already durable."""
+        inbox = Inbox(self.root)
+        stuck = inbox.audio / "stuck.m4a"
+        stuck.mkdir()  # unlink() refuses a directory
+        (stuck / "inner").write_bytes(b"audio")
+        with inbox.connect() as db:
+            db.execute("INSERT INTO chunks (id,sha256,device,started,duration,path,received)"
+                       " VALUES (?,?,?,?,?,?,?)",
+                       (f"{0:032x}", "0" * 64, "dev", "2026-03-10T09:00:00.000Z", 60.0,
+                        str(stuck), 0.0))
+        inbox.complete(f"{0:032x}", "spoken words")
+        self.assertIn("spoken words", (inbox.root / "life.md").read_text())
+        with inbox.connect() as db:
+            self.assertEqual(db.execute("SELECT path FROM chunks WHERE id=?",
+                                        (f"{0:032x}",)).fetchone()["path"], str(stuck))
+
+    def test_transcribed_audio_is_deleted_and_not_revisited(self):
+        inbox = Inbox(self.root)
+        audio = inbox.audio / "clip.m4a"
+        audio.write_bytes(b"audio")
+        with inbox.connect() as db:
+            db.execute("INSERT INTO chunks (id,sha256,device,started,duration,path,received)"
+                       " VALUES (?,?,?,?,?,?,?)",
+                       (f"{0:032x}", "0" * 64, "dev", "2026-03-10T09:00:00.000Z", 60.0,
+                        str(audio), 0.0))
+        inbox.complete(f"{0:032x}", "spoken words")
+        self.assertFalse(audio.exists())
+        with inbox.connect() as db:
+            self.assertEqual(db.execute("SELECT path FROM chunks WHERE id=?",
+                                        (f"{0:032x}",)).fetchone()["path"], "")
+
+    def test_no_connection_outlives_the_call_that_opened_it(self):
+        """One transcribed chunk opens several connections. Left to the garbage
+        collector they each hold three WAL descriptors, and macOS caps a process
+        at 256."""
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z"])
+        opened = []
+        real_connect = sqlite3.connect
+
+        def watched(*args, **kwargs):
+            db = real_connect(*args, **kwargs)
+            opened.append(db)
+            return db
+
+        sqlite3.connect = watched
+        try:
+            inbox.complete(f"{0:032x}", "spoken words")
+            inbox.status()
+        finally:
+            sqlite3.connect = real_connect
+        self.assertTrue(opened)
+        for db in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                db.execute("SELECT 1")
+
+    def test_startup_sweeps_audio_left_by_a_crash(self):
+        inbox = Inbox(self.root)
+        audio = inbox.audio / "orphan.m4a"
+        audio.write_bytes(b"audio")
+        with inbox.connect() as db:
+            db.execute("INSERT INTO chunks (id,sha256,device,started,duration,path,status,"
+                       "transcript,received) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (f"{0:032x}", "0" * 64, "dev", "2026-03-10T09:00:00.000Z", 60.0,
+                        str(audio), "complete", "spoken words", 0.0))
+        Inbox(self.root)  # restart
+        self.assertFalse(audio.exists())
 
 
 if __name__ == "__main__":
