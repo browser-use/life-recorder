@@ -83,6 +83,13 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(self.inbox.status(), {})
 
+    def test_caption_only_transcript_is_not_exported(self):
+        _, _, chunk_id = self.upload()
+        self.inbox.complete(chunk_id, "(wind blowing)")
+        text = (self.inbox.root / "life.md").read_text()
+        self.assertNotIn("wind blowing", text)
+        self.assertFalse(any((self.inbox.days).glob("*.md")))
+
     def test_offline_backlog_is_exported_by_capture_time(self):
         _, _, later = self.upload(started="2026-09-10T16:00:00.000Z")
         self.inbox.complete(later, "Later audio.")

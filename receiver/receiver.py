@@ -271,9 +271,12 @@ def transcribe(row, model: Path, work: Path, whisper: str, ffmpeg: str):
 def clean_transcript(text: str) -> str:
     """Remove empty/repetitive Whisper hallucinations while preserving speech."""
     text = unicodedata.normalize("NFKC", text or "")
-    # Whisper commonly inserts stage-direction markers between real speech.
+    # Whisper writes ambient sound as [inaudible], (wind blowing), and ♪ lyrics ♪.
+    # The old allowlist missed most of those captions because they do not start
+    # with a fixed word such as "music" or "noise".
     text = re.sub(r"\[[^\]]{0,120}\]", " ", text)
-    text = re.sub(r"\((?:speaking in foreign language|people chattering|music|applause|laughter|noise|inaudible)[^)]*\)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\([^)]{0,200}\)", " ", text)
+    text = re.sub(r"♪[^♪]*♪", " ", text)
     text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\t")
     words = " ".join(text.split()).split()
     if not words:

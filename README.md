@@ -39,7 +39,7 @@ The receiver writes the combined transcript to `life.md` in the data directory. 
 
 Tap the recorder switch once. Recording continues while the screen is locked and while other apps are used. If the iPhone is rebooted or the app is force-quit, iOS requires opening Life Recorder once before microphone capture can resume. Pending audio remains on the phone until the receiver acknowledges it. Upload tasks are retried and stale connectivity tasks are cancelled so they cannot hold the queue indefinitely.
 
-Whisper runs locally on the Mac. The receiver removes common stage-direction markers and highly repetitive hallucinated noise, then writes one continuous document with an hourly capture marker. This is cleanup, not a guarantee of perfect transcription.
+Whisper runs locally on the Mac. The receiver strips Whisper stage-direction captions — parenthetical and bracketed sound labels, plus lyric markers — and highly repetitive hallucinated noise, then writes one continuous document with an hourly capture marker. This is cleanup, not a guarantee of perfect transcription. A clip that is only captions is dropped.
 
 ## Using Codex to reproduce the setup
 
